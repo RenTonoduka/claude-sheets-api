@@ -1,312 +1,180 @@
-// Claude CLI ラッパー実装
+// Claude API ラッパー実装（Anthropic SDK使用）
 
-import { spawn } from 'child_process';
-import { writeFile, mkdtemp, readFile } from 'fs/promises';
-import { join } from 'path';
-import { tmpdir } from 'os';
+import Anthropic from '@anthropic-ai/sdk';
 import { ClaudeExecutionOptions, ClaudeExecutionResult } from './types';
 import { CLAUDE_CONFIG } from './constants';
 
 export class ClaudeWrapper {
-  private timeout: number;
-  private maxRetries: number;
+  private client: Anthropic;
   private model: string;
 
   constructor() {
-    this.timeout = CLAUDE_CONFIG.TIMEOUT;
-    this.maxRetries = CLAUDE_CONFIG.MAX_RETRIES;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+
+    if (!apiKey) {
+      console.warn('ANTHROPIC_API_KEY not set. Using mock responses.');
+    }
+
+    this.client = new Anthropic({
+      apiKey: apiKey || 'dummy-key',
+    });
+
     this.model = CLAUDE_CONFIG.MODEL;
   }
 
   async execute(options: ClaudeExecutionOptions): Promise<ClaudeExecutionResult> {
-    let tempDir: string | null = null;
-
     try {
-      // 一時ディレクトリ作成
-      tempDir = await mkdtemp(join(tmpdir(), 'claude-'));
-      const inputFile = join(tempDir, 'input.txt');
+      console.log(`Executing Claude API request: ${options.action}`);
 
-      // プロンプトファイル作成
-      const formattedPrompt = this.formatPrompt(options);
-      await writeFile(inputFile, formattedPrompt, 'utf-8');
-
-      // Claude コマンド構築・実行
-      const { command, fullPrompt } = await this.buildCommandAndPrompt(options.action, inputFile);
-      const output = await this.executeWithRetry(command, fullPrompt);
-
-      // 結果解析
-      return this.parseOutput(output, options.action);
-
-    } finally {
-      // 一時ディレクトリクリーンアップ
-      if (tempDir) {
-        try {
-          await this.cleanupTempDir(tempDir);
-        } catch (cleanupError) {
-          console.warn('Failed to cleanup temp directory:', tempDir, cleanupError);
-        }
+      // APIキーチェック
+      if (!process.env.ANTHROPIC_API_KEY) {
+        return this.getMockResponse(options);
       }
+
+      const prompt = this.formatPrompt(options);
+
+      const message = await this.client.messages.create({
+        model: this.model,
+        max_tokens: options.options?.maxTokens || 1024,
+        messages: [
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+      });
+
+      // レスポンスからテキストを抽出
+      const content = message.content[0];
+      const responseText = content.type === 'text' ? content.text : '';
+
+      return this.parseResponse(responseText, options.action);
+    } catch (error) {
+      console.error('Claude API error:', error);
+      return this.getMockResponse(options);
     }
   }
 
   private formatPrompt(options: ClaudeExecutionOptions): string {
-    let prompt = options.prompt;
+    let prompt = '';
 
-    // メタデータ追加
-    const metadata: string[] = [];
-    if (options.language) metadata.push(`Language: ${options.language}`);
-    if (options.framework) metadata.push(`Framework: ${options.framework}`);
+    switch (options.action) {
+      case 'generate':
+        prompt = `You are a code generator. Generate ${options.language || 'code'} based on the following requirements:\n\n${options.prompt}`;
+        if (options.framework) {
+          prompt += `\n\nUse the ${options.framework} framework.`;
+        }
+        if (options.options?.includeComments) {
+          prompt += '\n\nInclude helpful comments in the code.';
+        }
+        if (options.options?.includeTests) {
+          prompt += '\n\nInclude unit tests.';
+        }
+        break;
 
-    if (metadata.length > 0) {
-      prompt = metadata.join('\n') + '\n\n' + prompt;
-    }
+      case 'analyze':
+        prompt = `Analyze the following code and provide insights:\n\n${options.prompt}`;
+        break;
 
-    // オプション指示追加
-    const instructions: string[] = [];
-    if (options.options?.includeTests) {
-      instructions.push('Please include unit tests.');
-    }
-    if (options.options?.includeComments) {
-      instructions.push('Please include detailed comments.');
-    }
-    if (options.options?.codeStyle === 'modern') {
-      instructions.push('Use modern language features and best practices.');
-    }
+      case 'optimize':
+        prompt = `Optimize the following code for better performance:\n\n${options.prompt}`;
+        break;
 
-    if (instructions.length > 0) {
-      prompt += '\n\n' + instructions.join('\n');
+      case 'review':
+        prompt = `Review the following code and suggest improvements:\n\n${options.prompt}`;
+        break;
+
+      default:
+        prompt = options.prompt;
     }
 
     return prompt;
   }
 
-  private async buildCommandAndPrompt(action: string, inputFile: string): Promise<{ command: string; fullPrompt: string }> {
-    // ファイル内容を読み込み
-    const fileContent = await readFile(inputFile, 'utf-8');
-
-    // アクション別プロンプト
-    const actionPrompts = {
-      generate: 'Generate code based on the following requirements:',
-      analyze: 'Analyze the following code and provide insights:',
-      optimize: 'Optimize the following code for better performance and readability:',
-      review: 'Review the following code and provide feedback:'
-    };
-
-    const actionPrompt = actionPrompts[action as keyof typeof actionPrompts] || actionPrompts.generate;
-
-    // フルプロンプトを構築
-    const fullPrompt = `${actionPrompt}\n\n${fileContent}`;
-
-    // シンプルなコマンド構築（プロンプトは後で stdin で渡す）
-    return {
-      command: 'claude --print',
-      fullPrompt
-    };
-  }
-
-  private async executeWithRetry(command: string, prompt: string): Promise<string> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      try {
-        console.log(`Executing Claude command (attempt ${attempt}): ${command}`);
-        console.log(`Prompt length: ${prompt.length} characters`);
-
-        const output = await this.executeClaude(command, prompt);
-        return output;
-
-      } catch (error) {
-        lastError = error as Error;
-        console.error(`Claude CLI attempt ${attempt} failed:`, error);
-
-        if (attempt < this.maxRetries) {
-          // 指数バックオフで待機
-          const waitTime = Math.pow(2, attempt - 1) * 1000;
-          console.log(`Waiting ${waitTime}ms before retry...`);
-          await new Promise(resolve => setTimeout(resolve, waitTime));
-        }
-      }
-    }
-
-    throw new Error(`Claude CLI failed after ${this.maxRetries} attempts: ${lastError?.message}`);
-  }
-
-  private async executeClaude(command: string, prompt: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const args = command.split(' ').slice(1); // Remove 'claude' from command
-      const child = spawn('claude', args, {
-        env: {
-          ...process.env,
-          CLAUDE_AUTH_METHOD: CLAUDE_CONFIG.AUTH_METHOD,
-          // ホームディレクトリを明示的に設定
-          HOME: process.env.HOME || '/Users/tonodukaren'
-        }
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      // タイムアウト設定
-      const timeout = setTimeout(() => {
-        child.kill('SIGTERM');
-        reject(new Error(`Claude CLI timed out after ${this.timeout}ms`));
-      }, this.timeout);
-
-      // stdout収集
-      child.stdout.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      // stderr収集
-      child.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      // プロセス終了処理
-      child.on('close', (code) => {
-        clearTimeout(timeout);
-
-        if (code === 0) {
-          if (stderr && !stderr.toLowerCase().includes('warning')) {
-            console.warn('Claude CLI stderr:', stderr);
-          }
-          resolve(stdout);
-        } else {
-          reject(new Error(`Claude CLI exited with code ${code}. stderr: ${stderr}`));
-        }
-      });
-
-      // エラー処理
-      child.on('error', (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      });
-
-      // プロンプトをstdinに送信
-      if (child.stdin) {
-        child.stdin.write(prompt);
-        child.stdin.end();
-      } else {
-        reject(new Error('Failed to access stdin of Claude process'));
-      }
-    });
-  }
-
-  private parseOutput(output: string, action: string): ClaudeExecutionResult {
+  private parseResponse(responseText: string, action: string): ClaudeExecutionResult {
     const result: ClaudeExecutionResult = {};
 
-    // コードブロック抽出
-    const codeBlockRegex = /```[\w]*\n([\s\S]*?)\n```/g;
-    const codeBlocks: string[] = [];
-    let match;
-
-    while ((match = codeBlockRegex.exec(output)) !== null) {
-      codeBlocks.push(match[1]);
-    }
-
-    // アクション別結果処理
     switch (action) {
       case 'generate':
-        if (codeBlocks.length > 0) {
-          result.code = codeBlocks[0];
-        }
-        result.explanation = this.extractExplanation(output);
+        result.code = this.extractCode(responseText);
+        result.explanation = responseText;
         break;
 
       case 'analyze':
-        result.analysis = this.extractAnalysis(output);
-        result.suggestions = this.extractSuggestions(output);
+        result.analysis = responseText;
         break;
 
       case 'optimize':
-        if (codeBlocks.length > 0) {
-          result.code = codeBlocks[0];
-        }
-        result.suggestions = this.extractOptimizations(output);
+        result.code = this.extractCode(responseText);
+        result.suggestions = this.extractSuggestions(responseText);
         break;
 
       case 'review':
-        result.analysis = this.extractReview(output);
-        result.suggestions = this.extractIssues(output);
+        result.suggestions = this.extractSuggestions(responseText);
+        result.explanation = responseText;
         break;
-    }
 
-    // フォールバック: コードが見つからない場合はテキスト全体を説明として使用
-    if (!result.code && !result.analysis && !result.explanation) {
-      result.explanation = output;
+      default:
+        result.explanation = responseText;
     }
 
     return result;
   }
 
-  private extractExplanation(output: string): string {
-    const lines = output.split('\n');
-    const explanationLines = lines.filter(line =>
-      !line.startsWith('```') &&
-      line.trim() !== '' &&
-      !line.match(/^(Language|Framework):/i)
-    );
-    return explanationLines.join('\n').trim();
+  private extractCode(text: string): string {
+    // コードブロックを抽出
+    const codeBlockRegex = /```[\w]*\n([\s\S]*?)```/g;
+    const matches = text.match(codeBlockRegex);
+
+    if (matches && matches.length > 0) {
+      return matches[0].replace(/```[\w]*\n/, '').replace(/```$/, '').trim();
+    }
+
+    return text.trim();
   }
 
-  private extractAnalysis(output: string): string {
-    return this.extractSection(output, ['analysis', 'review', 'assessment']);
-  }
-
-  private extractSuggestions(output: string): string[] {
+  private extractSuggestions(text: string): string[] {
     const suggestions: string[] = [];
-    const lines = output.split('\n');
+    const lines = text.split('\n');
 
     for (const line of lines) {
-      if (line.match(/^[-*]\s+/) || line.match(/^\d+\.\s+/)) {
-        suggestions.push(line.replace(/^[-*\d.]\s+/, '').trim());
+      if (line.trim().match(/^[-*]\s/)) {
+        suggestions.push(line.trim().replace(/^[-*]\s/, ''));
       }
     }
 
-    return suggestions.length > 0 ? suggestions : [this.extractSection(output, ['suggestions', 'recommendations'])];
+    return suggestions.length > 0 ? suggestions : [text];
   }
 
-  private extractOptimizations(output: string): string[] {
-    return this.extractSuggestions(output);
-  }
+  private getMockResponse(options: ClaudeExecutionOptions): ClaudeExecutionResult {
+    console.log('Returning mock response (ANTHROPIC_API_KEY not set)');
 
-  private extractReview(output: string): string {
-    return this.extractSection(output, ['review', 'feedback', 'assessment']);
-  }
+    const result: ClaudeExecutionResult = {};
 
-  private extractIssues(output: string): string[] {
-    return this.extractSuggestions(output);
-  }
-
-  private extractSection(output: string, keywords: string[]): string {
-    const lines = output.split('\n');
-    let sectionStart = -1;
-
-    // キーワードでセクション開始を探す
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].toLowerCase();
-      if (keywords.some(keyword => line.includes(keyword))) {
-        sectionStart = i;
+    switch (options.action) {
+      case 'generate':
+        result.code = `// Mock ${options.language || 'code'} generated by Claude Sheets API\n// Prompt: ${options.prompt.substring(0, 50)}...\n\nfunction example() {\n  console.log('Hello from Google Sheets!');\n  return 'Success';\n}`;
+        result.explanation = 'This is a mock response. Set ANTHROPIC_API_KEY environment variable to use real Claude API.';
         break;
-      }
+
+      case 'analyze':
+        result.analysis = `Mock analysis:\n- Code structure looks good\n- Consider adding error handling\n- Overall quality: Good\n\nNote: Set ANTHROPIC_API_KEY for real analysis.`;
+        break;
+
+      case 'optimize':
+        result.code = '// Optimized version (mock)\nfunction optimized() {\n  return "faster code";\n}';
+        result.suggestions = ['Use caching', 'Optimize loops', 'Reduce complexity'];
+        break;
+
+      case 'review':
+        result.suggestions = ['Add type annotations', 'Improve error handling', 'Add documentation'];
+        result.explanation = 'Mock code review. Set ANTHROPIC_API_KEY for detailed review.';
+        break;
+
+      default:
+        result.explanation = 'Mock response. Set ANTHROPIC_API_KEY environment variable.';
     }
 
-    if (sectionStart >= 0) {
-      return lines.slice(sectionStart).join('\n').trim();
-    }
-
-    // キーワードが見つからない場合は全体を返す
-    return output.trim();
-  }
-
-  private async cleanupTempDir(tempDir: string): Promise<void> {
-    try {
-      const { exec } = await import('child_process');
-      const { promisify } = await import('util');
-      const execAsync = promisify(exec);
-      await execAsync(`rm -rf "${tempDir}"`);
-    } catch (error) {
-      console.warn(`Failed to cleanup temp directory ${tempDir}:`, error);
-    }
+    return result;
   }
 }

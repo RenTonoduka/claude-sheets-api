@@ -1,15 +1,6 @@
 # Node.js 18 LTS base image
 FROM node:18-slim
 
-# Install dependencies for Claude CLI
-RUN apt-get update && apt-get install -y \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Claude CLI
-RUN curl -fsSL https://claude.ai/cli/install.sh | sh
-
 # Set working directory
 WORKDIR /app
 
