@@ -35,8 +35,8 @@ export async function GET(): Promise<NextResponse> {
 async function checkClaudeService(): Promise<string> {
   try {
     // Claude CLI の簡単な可用性チェック
-    const { exec } = require('child_process');
-    const { promisify } = require('util');
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
     const execAsync = promisify(exec);
 
     await execAsync('which claude', { timeout: 5000 });

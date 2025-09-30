@@ -19,7 +19,7 @@ export interface ClaudeCodeResponse {
   error?: {
     code: string;
     message: string;
-    details?: any;
+    details?: unknown;
   };
   metadata: {
     timestamp: string;
