@@ -1,52 +1,124 @@
-// Claude API ラッパー実装（Anthropic SDK使用）
+// Claude API ラッパー実装（Token-based Authentication）
 
-import Anthropic from '@anthropic-ai/sdk';
 import { ClaudeExecutionOptions, ClaudeExecutionResult } from './types';
 import { CLAUDE_CONFIG } from './constants';
 
+interface TokenData {
+  access_token: string;
+  refresh_token: string;
+  expires_at: number;
+}
+
 export class ClaudeWrapper {
-  private client: Anthropic;
   private model: string;
+  private tokenData: TokenData | null = null;
 
   constructor() {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
+    this.model = CLAUDE_CONFIG.MODEL;
+    this.loadTokenData();
+  }
 
-    if (!apiKey) {
-      console.warn('ANTHROPIC_API_KEY not set. Using mock responses.');
+  private loadTokenData(): void {
+    const accessToken = process.env.CLAUDE_ACCESS_TOKEN;
+    const refreshToken = process.env.CLAUDE_REFRESH_TOKEN;
+    const expiresAt = process.env.CLAUDE_EXPIRES_AT;
+
+    if (accessToken && refreshToken && expiresAt) {
+      this.tokenData = {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_at: parseInt(expiresAt, 10),
+      };
+    } else {
+      console.warn('Claude tokens not set. Using mock responses.');
+    }
+  }
+
+  private async refreshAccessToken(): Promise<void> {
+    if (!this.tokenData) {
+      throw new Error('No token data available');
     }
 
-    this.client = new Anthropic({
-      apiKey: apiKey || 'dummy-key',
-    });
+    try {
+      const response = await fetch('https://claude.ai/api/auth/refresh', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          refresh_token: this.tokenData.refresh_token,
+        }),
+      });
 
-    this.model = CLAUDE_CONFIG.MODEL;
+      if (!response.ok) {
+        throw new Error(`Token refresh failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+      this.tokenData = {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || this.tokenData.refresh_token,
+        expires_at: data.expires_at,
+      };
+
+      console.log('Access token refreshed successfully');
+    } catch (error) {
+      console.error('Failed to refresh access token:', error);
+      throw error;
+    }
+  }
+
+  private async ensureValidToken(): Promise<string> {
+    if (!this.tokenData) {
+      throw new Error('No token data available');
+    }
+
+    const now = Date.now() / 1000;
+    if (now >= this.tokenData.expires_at - 300) {
+      await this.refreshAccessToken();
+    }
+
+    return this.tokenData.access_token;
   }
 
   async execute(options: ClaudeExecutionOptions): Promise<ClaudeExecutionResult> {
     try {
       console.log(`Executing Claude API request: ${options.action}`);
 
-      // APIキーチェック
-      if (!process.env.ANTHROPIC_API_KEY) {
+      if (!this.tokenData) {
         return this.getMockResponse(options);
       }
 
+      const accessToken = await this.ensureValidToken();
       const prompt = this.formatPrompt(options);
 
-      const message = await this.client.messages.create({
-        model: this.model,
-        max_tokens: options.options?.maxTokens || 1024,
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
+      const response = await fetch('https://claude.ai/api/append_message', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'anthropic-client-sha': 'unknown',
+          'anthropic-client-version': 'unknown',
+        },
+        body: JSON.stringify({
+          completion: {
+            prompt: prompt,
+            model: this.model,
+            max_tokens_to_sample: options.options?.maxTokens || 1024,
           },
-        ],
+          organization_uuid: process.env.CLAUDE_ORGANIZATION_UUID || null,
+          conversation_uuid: process.env.CLAUDE_CONVERSATION_UUID || null,
+          text: prompt,
+          attachments: [],
+        }),
       });
 
-      // レスポンスからテキストを抽出
-      const content = message.content[0];
-      const responseText = content.type === 'text' ? content.text : '';
+      if (!response.ok) {
+        throw new Error(`Claude API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const responseText = data.completion || data.text || '';
 
       return this.parseResponse(responseText, options.action);
     } catch (error) {
