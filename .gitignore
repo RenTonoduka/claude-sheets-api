@@ -39,9 +39,6 @@ yarn-error.log*
 # railway
 .railway/
 
-# claude temp files
-claude-*
-
 # typescript
 *.tsbuildinfo
 next-env.d.ts
